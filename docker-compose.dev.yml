@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: filmlist_db_dev
+    environment:
+      POSTGRES_DB: filmlist
+      POSTGRES_USER: filmlist
+      POSTGRES_PASSWORD: filmlist
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U filmlist -d filmlist"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - filmlist_network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: filmlist_redis_dev
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data_dev:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - filmlist_network
+
+  # Backend API (Development mode with hot reload)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: filmlist_backend_dev
+    environment:
+      - DATABASE_URL=postgresql://filmlist:filmlist@db:5432/filmlist
+      - REDIS_URL=redis://redis:6379
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - HF_TOKEN=${HF_TOKEN}
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
+      - BACKEND_CORS_ORIGINS=http://localhost:3000,http://localhost:8000
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - ./uploads:/app/uploads
+      - ./output:/app/output
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - filmlist_network
+
+  # Frontend (Development mode with hot reload)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: filmlist_frontend_dev
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - CHOKIDAR_USEPOLLING=true
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - filmlist_network
+
+volumes:
+  postgres_data_dev:
+  redis_data_dev:
+
+networks:
+  filmlist_network:
+    driver: bridge
