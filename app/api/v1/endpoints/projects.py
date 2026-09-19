@@ -64,7 +64,8 @@ async def save_project_changes(
     
     try:
         # Convert Pydantic models to dict for storage
-        rows_data = [row.dict() for row in save_request.montage_rows]
+        rows = save_request.resolved_rows()
+        rows_data = [row.dict() if hasattr(row, "dict") else row.model_dump() for row in rows]
         
         # Update both task result and project montage rows
         task.result = rows_data

@@ -13,13 +13,13 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Filmlist"
     
     # Database Configuration
-    DATABASE_URL: str = "postgresql://filmlist:filmlist@localhost/filmlist"
+    DATABASE_URL: str = "sqlite:///./filmlist.db"
     
-    # Redis Configuration
+    # Redis Configuration (optional in autonomous mode)
     REDIS_URL: str = "redis://localhost:6379"
     
-    # External API Keys
-    OPENAI_API_KEY: str
+    # External API Keys — optional; without them services use local fallbacks
+    OPENAI_API_KEY: Optional[str] = None
     HF_TOKEN: Optional[str] = None
     
     # File Storage
@@ -35,15 +35,19 @@ class Settings(BaseSettings):
     BACKEND_CORS_ORIGINS: Optional[List[str]] = ["http://localhost:3000", "http://localhost:8000"]
     
     # Security
-    SECRET_KEY: str = "your-secret-key-change-in-production"
+    SECRET_KEY: str = "dev-secret-key-change-in-production-32chars"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     
     # Logging Configuration
     LOG_LEVEL: str = "INFO"
     
-    # Development Configuration
-    DEBUG: bool = False
+    # Development / autonomous mode
+    DEBUG: bool = True
     RELOAD: bool = False
+    # When True: skip billing checks, seed free balance, prefer offline fallbacks
+    AUTONOMOUS_MODE: bool = True
+    SKIP_BILLING: bool = True
+    INITIAL_USER_BALANCE: float = 10000.0
     
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod
@@ -55,6 +59,12 @@ class Settings(BaseSettings):
         elif isinstance(v, (list, str)):
             return v
         raise ValueError(v)
+
+    @property
+    def has_openai(self) -> bool:
+        return bool(self.OPENAI_API_KEY and self.OPENAI_API_KEY not in (
+            "", "your_openai_token_here", "changeme"
+        ))
     
     class Config:
         env_file = ".env"

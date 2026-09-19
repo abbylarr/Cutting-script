@@ -37,11 +37,14 @@ class SceneAnalysisResult:
 
 
 class GPTVisualAnalysisService:
-    """Service for integrating GPT-5-mini visual analysis with keyframe extraction."""
+    """Service for integrating GPT visual analysis with keyframe extraction.
+    
+    Works without OPENAI_API_KEY — uses rule-based fallback analysis.
+    """
     
     def __init__(
         self, 
-        openai_api_key: str,
+        openai_api_key: Optional[str] = None,
         keyframe_service: Optional[KeyframeExtractionService] = None,
         prompt_system: Optional[MontageAssistantPromptSystem] = None
     ):
@@ -49,14 +52,33 @@ class GPTVisualAnalysisService:
         Initialize the GPT visual analysis service.
         
         Args:
-            openai_api_key: OpenAI API key for GPT-5-mini
+            openai_api_key: OpenAI API key (optional — enables GPT path)
             keyframe_service: Optional keyframe extraction service instance
             prompt_system: Optional prompt system instance
         """
-        self.api_key = openai_api_key
+        from app.core.config import settings
+        self.api_key = openai_api_key if openai_api_key is not None else (settings.OPENAI_API_KEY or "")
+        self.use_gpt = bool(self.api_key and self.api_key not in ("", "your_openai_token_here", "changeme"))
         self.keyframe_service = keyframe_service or KeyframeExtractionService()
         self.prompt_system = prompt_system or MontageAssistantPromptSystem()
         self.base_url = "https://api.openai.com/v1/chat/completions"
+        if not self.use_gpt:
+            logger.warning("OPENAI_API_KEY not set — visual analysis will use offline fallback")
+    
+    async def analyze_scenes(
+        self,
+        video_path: str,
+        scenes: List[Scene],
+        task_id: str,
+        dialogue_mapping: Optional[Dict[int, str]] = None,
+    ) -> List[SceneAnalysisResult]:
+        """Adapter used by PipelineOrchestrator."""
+        return await self.analyze_scenes_with_visual_analysis(
+            video_path=video_path,
+            scenes=scenes,
+            task_id=task_id,
+            dialogue_mapping=dialogue_mapping,
+        )
         
     async def analyze_scenes_with_visual_analysis(
         self,
@@ -152,6 +174,9 @@ class GPTVisualAnalysisService:
         """
         import time
         start_time = time.time()
+        
+        if not self.use_gpt:
+            return self._create_fallback_analysis(scene, scene_index, keyframes)
         
         if len(keyframes) < 2:
             logger.warning(f"Scene {scene_index} has insufficient keyframes ({len(keyframes)})")

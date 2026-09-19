@@ -108,5 +108,16 @@ class MontageUpdateRequest(BaseModel):
 
 
 class SaveProjectRequest(BaseModel):
-    montage_rows: List[MontageRow] = Field(..., description="Montage rows to save")
+    montage_rows: Optional[List[MontageRow]] = Field(
+        None, description="Montage rows to save"
+    )
+    rows: Optional[List[MontageRow]] = Field(
+        None, description="Alias for montage_rows (frontend)"
+    )
     regenerate_docx: bool = Field(True, description="Whether to regenerate DOCX file")
+
+    def resolved_rows(self) -> List[MontageRow]:
+        rows = self.montage_rows or self.rows
+        if not rows:
+            raise ValueError("montage_rows (or rows) is required")
+        return rows

@@ -2,12 +2,11 @@
 FilmProject model for storing film metadata and montage data.
 """
 from sqlalchemy import Column, String, DateTime, func, ForeignKey, Text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 import uuid
 
 from app.db.base import Base
-from app.db.types import UUID
+from app.db.types import UUID, JSONType
 
 
 class FilmProject(Base):
@@ -17,9 +16,9 @@ class FilmProject(Base):
     user_id = Column(UUID(), ForeignKey("users.id"), nullable=False)
     task_id = Column(UUID(), ForeignKey("processing_tasks.id"), nullable=False)
     title = Column(String(255), nullable=False)
-    film_metadata = Column(JSONB().with_variant(Text, "sqlite"), nullable=False)  # Film metadata (production company, year, etc.)
-    montage_rows = Column(JSONB().with_variant(Text, "sqlite"), nullable=True)  # Processed montage table data
-    project_settings = Column(JSONB().with_variant(Text, "sqlite"), nullable=True)  # Timecode settings, standards, etc.
+    film_metadata = Column(JSONType(), nullable=False)
+    montage_rows = Column(JSONType(), nullable=True)
+    project_settings = Column(JSONType(), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

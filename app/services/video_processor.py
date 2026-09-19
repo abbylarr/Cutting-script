@@ -71,7 +71,12 @@ class VideoValidationService:
     MAX_DURATION = 4 * 60 * 60
     
     def __init__(self):
-        self._check_ffmpeg_availability()
+        self._ffmpeg_available = True
+        try:
+            self._check_ffmpeg_availability()
+        except FFmpegError as e:
+            self._ffmpeg_available = False
+            logger.warning(f"FFmpeg not available at init: {e}")
     
     def _check_ffmpeg_availability(self) -> None:
         """Check if FFmpeg is available in the system."""
@@ -325,7 +330,12 @@ class AudioExtractionService:
     AUDIO_CHANNELS = 1  # Mono
     
     def __init__(self):
-        self._check_ffmpeg_availability()
+        self._ffmpeg_available = True
+        try:
+            self._check_ffmpeg_availability()
+        except FFmpegError as e:
+            self._ffmpeg_available = False
+            logger.warning(f"FFmpeg not available for audio extraction: {e}")
     
     def _check_ffmpeg_availability(self) -> None:
         """Check if FFmpeg is available in the system."""
@@ -520,8 +530,9 @@ class AudioExtractionService:
             raise FFmpegError(f"Failed to parse audio info: {e}")
         except Exception as e:
             raise FFmpegError(f"Audio info extraction error: {str(e)}")
-@dataclass
 
+
+@dataclass
 class Scene:
     """Represents a detected scene in a video."""
     start_time: float  # seconds
@@ -534,19 +545,78 @@ class Scene:
         if self.duration == 0:
             self.duration = self.end_time - self.start_time
 
+    @property
+    def keyframe_35_time(self) -> float:
+        return self.start_time + (self.duration * 0.35)
+
+    @property
+    def keyframe_70_time(self) -> float:
+        return self.start_time + (self.duration * 0.70)
+
 
 class SceneDetectionService:
     """Service for detecting scenes in video files using python-scenedetect."""
     
     def __init__(self):
-        self._check_scenedetect_availability()
+        self._scenedetect_available = self._check_scenedetect_availability()
     
-    def _check_scenedetect_availability(self) -> None:
+    def _check_scenedetect_availability(self) -> bool:
         """Check if scenedetect is available."""
         try:
-            import scenedetect
+            import scenedetect  # noqa: F401
+            return True
         except ImportError:
-            raise ImportError("python-scenedetect is not installed. Install with: pip install scenedetect[opencv]")
+            logger.warning(
+                "python-scenedetect is not installed; will use time-based scene fallback"
+            )
+            return False
+
+    async def _fallback_time_based_scenes(
+        self,
+        video_path: str,
+        min_scene_length: float = 2.0,
+        chunk_seconds: float = 30.0,
+    ) -> List[Scene]:
+        """Create evenly spaced scenes when scenedetect is unavailable."""
+        duration = 60.0
+        try:
+            validator = VideoValidationService()
+            result = await validator.validate_video(video_path)
+            if result.metadata and result.metadata.duration:
+                duration = result.metadata.duration
+        except Exception as e:
+            logger.warning(f"Could not probe video duration for fallback scenes: {e}")
+
+        chunk = max(min_scene_length, chunk_seconds)
+        scenes: List[Scene] = []
+        start = 0.0
+        while start < duration:
+            end = min(start + chunk, duration)
+            if end - start < min_scene_length * 0.5 and scenes:
+                last = scenes[-1]
+                scenes[-1] = Scene(
+                    start_time=last.start_time,
+                    end_time=duration,
+                    duration=duration - last.start_time,
+                    scene_number=last.scene_number,
+                )
+                break
+            scenes.append(
+                Scene(
+                    start_time=start,
+                    end_time=end,
+                    duration=end - start,
+                    scene_number=len(scenes) + 1,
+                )
+            )
+            start = end
+
+        if not scenes:
+            scenes.append(
+                Scene(start_time=0.0, end_time=duration, duration=duration, scene_number=1)
+            )
+        logger.info(f"Fallback scene detection produced {len(scenes)} scenes")
+        return scenes
     
     async def detect_scenes(
         self, 
@@ -567,11 +637,15 @@ class SceneDetectionService:
         Returns:
             List of detected scenes
         """
+        if not self._scenedetect_available:
+            return await self._fallback_time_based_scenes(
+                video_path, min_scene_length=min_scene_length
+            )
+
         try:
             # Import scenedetect modules
             from scenedetect import VideoManager, SceneManager
             from scenedetect.detectors import ContentDetector
-            from scenedetect.video_splitter import split_video_ffmpeg
             
             logger.info(f"Starting scene detection for {video_path}")
             
@@ -690,22 +764,35 @@ class SceneDetectionService:
         Returns:
             List of detected scenes
         """
-        # Try primary detection
-        scenes = await self.detect_scenes(
-            video_path, 
-            threshold=primary_threshold, 
-            min_scene_length=min_scene_length
-        )
-        
-        # If too few scenes detected, try more sensitive detection
-        if len(scenes) < 3:
-            logger.info(f"Only {len(scenes)} scenes detected, trying more sensitive detection")
+        try:
             scenes = await self.detect_scenes(
-                video_path, 
-                threshold=fallback_threshold, 
-                min_scene_length=min_scene_length
+                video_path,
+                threshold=primary_threshold,
+                min_scene_length=min_scene_length,
             )
-        
+        except Exception as e:
+            logger.warning(f"Primary scene detection failed ({e}), using time-based fallback")
+            return await self._fallback_time_based_scenes(
+                video_path, min_scene_length=min_scene_length
+            )
+
+        # If too few scenes detected, try more sensitive detection
+        if len(scenes) < 3 and self._scenedetect_available:
+            logger.info(f"Only {len(scenes)} scenes detected, trying more sensitive detection")
+            try:
+                scenes = await self.detect_scenes(
+                    video_path,
+                    threshold=fallback_threshold,
+                    min_scene_length=min_scene_length,
+                )
+            except Exception as e:
+                logger.warning(f"Fallback threshold detection failed: {e}")
+
+        if not scenes:
+            scenes = await self._fallback_time_based_scenes(
+                video_path, min_scene_length=min_scene_length
+            )
+
         return scenes
     
     async def get_scene_statistics(self, scenes: List[Scene]) -> Dict:

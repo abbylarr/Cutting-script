@@ -2,12 +2,11 @@
 ProcessingTask model for video processing jobs.
 """
 from sqlalchemy import Column, String, Float, Text, DateTime, Boolean, func, ForeignKey
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 import uuid
 
 from app.db.base import Base
-from app.db.types import UUID
+from app.db.types import UUID, JSONType
 
 
 class ProcessingTask(Base):
@@ -25,7 +24,7 @@ class ProcessingTask(Base):
     progress = Column(Float, default=0.0, nullable=False)
     current_step = Column(String(100), nullable=True)
     error_message = Column(Text, nullable=True)
-    result = Column(JSONB().with_variant(Text, "sqlite"), nullable=True)  # Stores montage rows as JSON
+    result = Column(JSONType(), nullable=True)  # Stores montage rows as JSON
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

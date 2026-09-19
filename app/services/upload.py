@@ -10,7 +10,11 @@ from typing import Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 import aiofiles
 from fastapi import UploadFile, HTTPException
-import magic
+
+try:
+    import magic
+except ImportError:  # optional dependency
+    magic = None
 
 from app.core.config import settings
 from app.schemas.upload import VideoValidationResult, SRTValidationResult
@@ -24,7 +28,12 @@ class FileUploadService:
     # Supported video formats
     SUPPORTED_VIDEO_FORMATS = {
         'video/mp4', 'video/avi', 'video/mov', 'video/mkv', 
-        'video/wmv', 'video/flv', 'video/webm', 'video/m4v'
+        'video/wmv', 'video/flv', 'video/webm', 'video/m4v',
+        'application/octet-stream',  # browsers sometimes send this
+    }
+    
+    SUPPORTED_VIDEO_EXTENSIONS = {
+        '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'
     }
     
     # Supported SRT formats
@@ -49,11 +58,25 @@ class FileUploadService:
             errors.append(f"File size {file.size} exceeds maximum allowed size {self.MAX_VIDEO_SIZE}")
             
         # Check MIME type
-        mime_type = magic.from_buffer(await file.read(1024), mime=True)
-        await file.seek(0)  # Reset file pointer
-        
-        if mime_type not in self.SUPPORTED_VIDEO_FORMATS:
-            errors.append(f"Unsupported video format: {mime_type}")
+        mime_type = None
+        if magic is not None:
+            try:
+                mime_type = magic.from_buffer(await file.read(1024), mime=True)
+                await file.seek(0)
+            except Exception:
+                await file.seek(0)
+                mime_type = None
+
+        if mime_type is None:
+            # Fallback: trust extension when python-magic is unavailable
+            ext = Path(file.filename or "").suffix.lower()
+            mime_type = mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+            if ext not in self.SUPPORTED_VIDEO_EXTENSIONS and mime_type not in self.SUPPORTED_VIDEO_FORMATS:
+                errors.append(f"Unsupported video format: {ext or mime_type}")
+        elif mime_type not in self.SUPPORTED_VIDEO_FORMATS:
+            ext = Path(file.filename or "").suffix.lower()
+            if ext not in self.SUPPORTED_VIDEO_EXTENSIONS:
+                errors.append(f"Unsupported video format: {mime_type}")
             
         # Basic filename validation
         if not file.filename or not self._is_safe_filename(file.filename):

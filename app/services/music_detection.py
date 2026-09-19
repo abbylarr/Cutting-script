@@ -815,10 +815,16 @@ class MusicDetectionService:
         self.primary_service = None
         self.fallback_service = FallbackMusicDetectionService()
         
+        # Prefer fast heuristic fallback in autonomous / offline mode
+        from app.core.config import settings
+        if settings.AUTONOMOUS_MODE or not settings.has_openai:
+            logger.info("Autonomous mode: using fallback music detection")
+            return
+
         # Try to initialize primary service
         try:
             # Check if librosa is available
-            import librosa
+            import librosa  # noqa: F401
             self.primary_service = SceneMusicDetectionService()
             logger.info("Librosa-based music detection service initialized")
         except ImportError:

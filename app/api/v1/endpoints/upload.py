@@ -1,102 +1,200 @@
 """
 File upload endpoints for video and SRT files.
 """
-from typing import Dict, Any
+import json
+import logging
+from typing import Optional
 from uuid import UUID
-from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, status
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, status, Form
 from sqlalchemy.orm import Session
 
 from app.core.auth import get_current_user
 from app.core.cache import check_upload_rate_limit
+from app.core.config import settings
 from app.db.base import get_db
 from app.models.user import User
 from app.models.processing_task import ProcessingTask
+from app.models.film_project import FilmProject
 from app.schemas.upload import (
-    UploadResponse, SRTUploadResponse, UploadError, 
-    VideoValidationResult, SRTValidationResult
+    UploadResponse, SRTUploadResponse, UploadError,
 )
 from app.services.upload import upload_service
 from app.services.billing import billing_service
+from app.services.processing_runner import enqueue_video_processing
+from app.services.task_queue import TaskPriority
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _parse_json_form(raw: Optional[str], field_name: str) -> dict:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("must be a JSON object")
+        return data
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid {field_name}: {e}",
+        )
 
 
 @router.post("/upload", response_model=UploadResponse)
 async def upload_video(
     file: UploadFile = File(...),
+    metadata: Optional[str] = Form(None),
+    settings_json: Optional[str] = Form(None, alias="settings"),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     Upload video file for processing.
-    
-    - **file**: Video file to upload (MP4, AVI, MOV, MKV, etc.)
-    - Returns task_id for tracking processing status
+
+    Accepts optional Form fields:
+    - metadata: JSON FilmMetadata
+    - settings: JSON {timecode_start, standard, use_srt, fps?}
     """
-    # Check upload rate limit
     rate_limit_result = await check_upload_rate_limit(str(current_user.id))
     if not rate_limit_result["allowed"]:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Upload rate limit exceeded. Try again in {rate_limit_result['retry_after']} seconds"
+            detail=(
+                f"Upload rate limit exceeded. "
+                f"Try again in {rate_limit_result['retry_after']} seconds"
+            ),
         )
-    
-    # Validate video file
+
     validation_result = await upload_service.validate_video_file(file)
-    
     if not validation_result.is_valid:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=UploadError(
                 error="Video validation failed",
-                details=[{"field": "file", "message": error, "code": "VALIDATION_ERROR"} 
-                        for error in validation_result.errors],
+                details=[
+                    {"field": "file", "message": error, "code": "VALIDATION_ERROR"}
+                    for error in validation_result.errors
+                ],
                 max_file_size=upload_service.MAX_VIDEO_SIZE,
-                supported_formats=list(upload_service.SUPPORTED_VIDEO_FORMATS)
-            ).dict()
+                supported_formats=list(upload_service.SUPPORTED_VIDEO_FORMATS),
+            ).dict(),
         )
-    
-    # Calculate estimated cost and check user balance
+
+    film_metadata = _parse_json_form(metadata, "metadata")
+    project_settings = _parse_json_form(settings_json, "settings")
+    use_srt = bool(project_settings.get("use_srt", False))
+
     estimated_duration = validation_result.duration or 0
-    estimated_cost = await billing_service.calculate_cost(estimated_duration / 60)  # Convert to minutes
-    
-    if not await billing_service.has_sufficient_balance(current_user.id, estimated_cost):
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Insufficient balance. Required: {estimated_cost:.2f} rubles, Available: {current_user.balance:.2f} rubles"
-        )
-    
+    estimated_cost = float(
+        billing_service.calculate_cost(estimated_duration / 60)
+    )
+
+    skip_billing = settings.SKIP_BILLING or settings.AUTONOMOUS_MODE
+    if not skip_billing:
+        if not billing_service.has_sufficient_balance(
+            db, str(current_user.id), billing_service.calculate_cost(estimated_duration / 60)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=(
+                    f"Insufficient balance. Required: {estimated_cost:.2f} rubles, "
+                    f"Available: {current_user.balance:.2f} rubles"
+                ),
+            )
+
     try:
-        # Save video file with user isolation
         file_path, file_hash = await upload_service.save_video_file(file, current_user.id)
-        
-        # Create processing task
+
         task = ProcessingTask(
             user_id=current_user.id,
-            video_filename=file.filename,
+            video_filename=file.filename or "video.mp4",
             video_path=file_path,
             file_hash=file_hash,
             estimated_cost=estimated_cost,
-            status="pending"
+            use_srt=use_srt,
+            status="pending",
+            progress=0.0,
+            current_step="queued",
         )
-        
         db.add(task)
+        db.flush()
+
+        title = film_metadata.get("title") or (file.filename or "Без названия")
+        if not film_metadata:
+            film_metadata = {
+                "title": title,
+                "production_company": "Не указано",
+                "year": 2024,
+                "country": "Россия",
+                "screenwriters": ["Не указано"],
+                "copyright_holders": ["Не указано"],
+                "duration": "00:00:00",
+                "episodes_count": 1,
+                "format": "Digital",
+                "color_type": "Цветной",
+                "media_carrier": "Файл",
+                "original_language": "Русский",
+                "audio_language": "Русский",
+            }
+
+        project = FilmProject(
+            user_id=current_user.id,
+            task_id=task.id,
+            title=title,
+            film_metadata=film_metadata,
+            project_settings=project_settings or {
+                "timecode_start": "01:00:00:00",
+                "standard": "ГФФ",
+                "fps": 25.0,
+            },
+        )
+        db.add(project)
         db.commit()
         db.refresh(task)
-        
+
+        # If SRT mode — wait for SRT upload before starting pipeline
+        if use_srt:
+            logger.info(f"Task {task.id} created in SRT mode — waiting for subtitle upload")
+        else:
+            try:
+                await enqueue_video_processing(
+                    task_id=str(task.id),
+                    user_id=str(current_user.id),
+                    video_path=file_path,
+                    use_srt=False,
+                    film_metadata=film_metadata,
+                    project_settings=project_settings,
+                    priority=TaskPriority.NORMAL,
+                )
+                task.status = "processing"
+                db.commit()
+            except Exception as e:
+                logger.error(f"Failed to enqueue task {task.id}: {e}")
+                task.status = "failed"
+                task.error_message = f"Failed to enqueue: {e}"
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to start processing: {e}",
+                )
+
         return UploadResponse(
             task_id=task.id,
             filename=file.filename,
             file_size=validation_result.file_size,
             estimated_cost=estimated_cost,
-            estimated_duration=estimated_duration / 60  # Convert to minutes
+            estimated_duration=estimated_duration / 60,
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save uploaded file: {str(e)}"
+            detail=f"Failed to save uploaded file: {str(e)}",
         )
 
 
@@ -105,124 +203,62 @@ async def upload_srt(
     task_id: UUID,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """
-    Upload SRT file for existing processing task.
-    
-    - **task_id**: ID of the processing task to update
-    - **file**: SRT subtitle file
-    - Returns updated task information
-    """
-    # Get processing task and verify ownership
+    """Upload SRT and start (or re-start) processing in SRT mode."""
     task = db.query(ProcessingTask).filter(
         ProcessingTask.id == task_id,
-        ProcessingTask.user_id == current_user.id
+        ProcessingTask.user_id == current_user.id,
     ).first()
-    
+
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Processing task not found"
+            detail="Processing task not found",
         )
-    
-    if task.status not in ["pending", "completed"]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot upload SRT for task in status: {task.status}"
-        )
-    
-    # Validate SRT file
+
     validation_result = await upload_service.validate_srt_file(file)
-    
     if not validation_result.is_valid:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=UploadError(
-                error="SRT validation failed",
-                details=[{"field": "file", "message": error, "code": "VALIDATION_ERROR"} 
-                        for error in validation_result.errors]
-            ).dict()
+            detail=f"SRT validation failed: {validation_result.errors}",
         )
-    
+
     try:
-        # Save SRT file
         srt_path = await upload_service.save_srt_file(file, current_user.id, task_id)
-        
-        # Process SRT with video to create scene mapping
-        from app.services.upload import srt_processor
-        processing_result = await srt_processor.process_srt_with_video(srt_path, task.video_path)
-        
-        # Update task with SRT information and processing results
         task.srt_path = srt_path
         task.use_srt = True
-        task.status = "completed"  # Mark as completed since SRT processing is done
-        task.result = processing_result  # Store the processed scenes
-        task.progress = 1.0
-        task.current_step = "SRT processing completed"
-        
+        task.status = "processing"
+        task.current_step = "queued"
+        task.progress = 0.0
         db.commit()
-        
+
+        project = db.query(FilmProject).filter(FilmProject.task_id == task.id).first()
+        film_metadata = project.film_metadata if project else None
+        project_settings = project.project_settings if project else None
+
+        await enqueue_video_processing(
+            task_id=str(task.id),
+            user_id=str(current_user.id),
+            video_path=task.video_path,
+            srt_path=srt_path,
+            use_srt=True,
+            film_metadata=film_metadata,
+            project_settings=project_settings,
+            priority=TaskPriority.HIGH,
+        )
+
         return SRTUploadResponse(
             task_id=task.id,
-            filename=file.filename,
-            scenes_updated=len(processing_result.get('scenes', [])),
-            processing_mode="srt_mode"
+            filename=file.filename or "subtitles.srt",
+            scenes_updated=0,
+            processing_mode="srt_mode",
         )
-        
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save SRT file: {str(e)}"
+            detail=f"Failed to process SRT: {str(e)}",
         )
-
-
-@router.get("/validate/video")
-async def validate_video_endpoint(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user)
-) -> VideoValidationResult:
-    """
-    Validate video file without uploading.
-    
-    - **file**: Video file to validate
-    - Returns validation result with metadata
-    """
-    return await upload_service.validate_video_file(file)
-
-
-@router.get("/validate/srt")
-async def validate_srt_endpoint(
-    file: UploadFile = File(...),
-    current_user: User = Depends(get_current_user)
-) -> SRTValidationResult:
-    """
-    Validate SRT file without uploading.
-    
-    - **file**: SRT file to validate
-    - Returns validation result with subtitle information
-    """
-    return await upload_service.validate_srt_file(file)
-
-
-@router.get("/limits")
-async def get_upload_limits(
-    current_user: User = Depends(get_current_user)
-) -> Dict[str, Any]:
-    """
-    Get upload limits and supported formats for current user.
-    """
-    rate_limit_result = await check_upload_rate_limit(str(current_user.id))
-    
-    return {
-        "max_video_size": upload_service.MAX_VIDEO_SIZE,
-        "max_srt_size": upload_service.MAX_SRT_SIZE,
-        "supported_video_formats": list(upload_service.SUPPORTED_VIDEO_FORMATS),
-        "supported_srt_formats": list(upload_service.SUPPORTED_SRT_FORMATS),
-        "rate_limit": {
-            "allowed": rate_limit_result["allowed"],
-            "remaining": rate_limit_result.get("remaining", 0),
-            "retry_after": rate_limit_result.get("retry_after", 0)
-        }
-    }

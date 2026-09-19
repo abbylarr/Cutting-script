@@ -25,12 +25,14 @@ venv/
 venv311/
 env/
 ENV/
+.venv/
 
-# Environment variables
+# Environment variables / secrets
 .env
 .env.local
 .env.production
 .env.development
+.env.*.local
 
 # Database
 *.db
@@ -40,15 +42,22 @@ ENV/
 *.log
 logs/
 
-# IDE
+# IDE / agent tooling
 .vscode/
 .idea/
+.kiro/
 *.swp
 *.swo
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Node
+node_modules/
+frontend/node_modules/
+npm-debug.log*
+yarn-error.log*
 
 # User uploads and generated files
 uploads/*
@@ -60,11 +69,16 @@ output/*
 tmp/
 temp/
 
-# Testing
+# Testing / coverage
 .pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+.ruff_cache/
 
-# Alembic
-alembic/versions/*.py
-!alembic/versions/__init__.py
+# Generated smoke / media artifacts (keep sources intentionally small)
+tests/fixtures/*_audio.wav
+tests/fixtures/smoke_video.mp4
+
+# Alembic — track migrations; ignore local junk only
+alembic/versions/__pycache__/

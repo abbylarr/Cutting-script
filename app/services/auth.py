@@ -71,9 +71,13 @@ class AuthService:
         
         # Create new user
         hashed_password = self.get_password_hash(user_create.password)
+        initial_balance = settings.INITIAL_USER_BALANCE if (
+            settings.AUTONOMOUS_MODE or settings.SKIP_BILLING
+        ) else 0.0
         db_user = User(
             email=user_create.email,
-            password_hash=hashed_password
+            password_hash=hashed_password,
+            balance=initial_balance,
         )
         
         db.add(db_user)
